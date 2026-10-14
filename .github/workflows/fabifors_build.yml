@@ -75,6 +75,8 @@ jobs:
             | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
           tag="${{ inputs.zed_tag }}"
           tag="${tag:-$latest}"
+          # The fork has no tags of its own; fetch Zed's to find the release the branch sits on.
+          git fetch --quiet --filter=blob:none --no-tags "$UPSTREAM" '+refs/tags/v*:refs/tags/v*'
           base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-pre' HEAD)
           patches=$(git rev-parse --short=10 HEAD)
           name="${tag}-fabifors-${patches}"
@@ -97,7 +99,6 @@ jobs:
           base="${{ steps.pick.outputs.base }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch --filter=blob:none "$UPSTREAM" "refs/tags/$tag:refs/tags/$tag"
           if [ "$tag" != "$base" ]; then
             git checkout --detach "$tag"
             if ! git cherry-pick "$base..$PATCH_BRANCH"; then
