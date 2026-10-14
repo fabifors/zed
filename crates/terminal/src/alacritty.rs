@@ -111,6 +111,114 @@ impl PtySender {
     }
 }
 
+/// Passes PTY output through a [`ProgressScanner`] on its way to alacritty's parser,
+/// which ignores `OSC 9 ; 4` progress reports.
+#[cfg(unix)]
+mod progress_pty {
+    use std::{fs::File, io, sync::Arc};
+
+    use alacritty_terminal::{
+        event::{OnResize, WindowSize},
+        tty::{ChildEvent, EventedPty, EventedReadWrite},
+    };
+    use futures::channel::mpsc::UnboundedSender;
+    use polling::{Event, PollMode, Poller};
+
+    use super::AlacrittyPty;
+    use crate::{PtyEvent, TerminalBackendEvent, progress::ProgressScanner};
+
+    pub(crate) struct ProgressPty {
+        pty: AlacrittyPty,
+        reader: ProgressReader,
+    }
+
+    impl ProgressPty {
+        pub(crate) fn new(
+            pty: AlacrittyPty,
+            events_tx: UnboundedSender<PtyEvent>,
+        ) -> io::Result<Self> {
+            // A duplicate of the PTY's file descriptor shares its open file description,
+            // so it reads the same stream and is ready whenever the registered one is.
+            let file = pty.file().try_clone()?;
+            Ok(Self {
+                pty,
+                reader: ProgressReader {
+                    file,
+                    scanner: ProgressScanner::default(),
+                    events_tx,
+                },
+            })
+        }
+    }
+
+    pub(crate) struct ProgressReader {
+        file: File,
+        scanner: ProgressScanner,
+        events_tx: UnboundedSender<PtyEvent>,
+    }
+
+    impl io::Read for ProgressReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let len = self.file.read(buf)?;
+            let events_tx = &self.events_tx;
+            self.scanner.scan(&buf[..len], |progress| {
+                events_tx
+                    .unbounded_send(PtyEvent::Event(TerminalBackendEvent::Progress(progress), 0))
+                    .ok();
+            });
+            Ok(len)
+        }
+    }
+
+    impl EventedReadWrite for ProgressPty {
+        type Reader = ProgressReader;
+        type Writer = <AlacrittyPty as EventedReadWrite>::Writer;
+
+        unsafe fn register(
+            &mut self,
+            poll: &Arc<Poller>,
+            interest: Event,
+            mode: PollMode,
+        ) -> io::Result<()> {
+            // SAFETY: the registered sources belong to `self.pty`, which lives as long as `self`.
+            unsafe { self.pty.register(poll, interest, mode) }
+        }
+
+        fn reregister(
+            &mut self,
+            poll: &Arc<Poller>,
+            interest: Event,
+            mode: PollMode,
+        ) -> io::Result<()> {
+            self.pty.reregister(poll, interest, mode)
+        }
+
+        fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+            self.pty.deregister(poll)
+        }
+
+        fn reader(&mut self) -> &mut Self::Reader {
+            &mut self.reader
+        }
+
+        fn writer(&mut self) -> &mut Self::Writer {
+            self.pty.writer()
+        }
+    }
+
+    impl EventedPty for ProgressPty {
+        fn next_child_event(&mut self) -> Option<ChildEvent> {
+            self.pty.next_child_event()
+        }
+    }
+
+    impl OnResize for ProgressPty {
+        fn on_resize(&mut self, window_size: WindowSize) {
+            self.pty.on_resize(window_size)
+        }
+    }
+}
+
 fn window_size_from_terminal_bounds(bounds: TerminalBounds) -> WindowSize {
     WindowSize {
         num_lines: bounds.num_lines() as u16,
@@ -217,6 +325,9 @@ pub(super) fn spawn_event_loop(
     pty: AlacrittyPty,
     drain_on_exit: bool,
 ) -> Result<PtySender> {
+    #[cfg(unix)]
+    let pty = progress_pty::ProgressPty::new(pty, events_tx.clone())
+        .context("failed to watch the pty for progress reports")?;
     let event_loop = EventLoop::new(
         term,
         ZedListener {

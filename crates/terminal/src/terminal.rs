@@ -1,8 +1,11 @@
 mod mappings;
 
 mod alacritty;
+mod progress;
 mod pty_info;
 pub mod terminal_settings;
+
+pub use progress::TerminalProgress;
 
 #[cfg(not(windows))]
 use anyhow::Context as _;
@@ -669,6 +672,8 @@ pub fn insert_zed_terminal_env(
 pub enum Event {
     TitleChanged,
     BreadcrumbsChanged,
+    /// The program reported progress with `OSC 9 ; 4`; see [`Terminal::progress`].
+    ProgressChanged,
     OutputReplaced,
     CloseTerminal,
     Bell,
@@ -726,6 +731,7 @@ pub(crate) enum TerminalBackendEvent {
     MouseCursorDirty,
     Title(String),
     ResetTitle,
+    Progress(Option<TerminalProgress>),
     ClipboardStore(String),
     ClipboardLoad(ClipboardFormatter),
     ColorRequest(usize, ColorFormatter),
@@ -744,6 +750,7 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::MouseCursorDirty => f.write_str("MouseCursorDirty"),
             Self::Title(title) => write!(f, "Title({title})"),
             Self::ResetTitle => f.write_str("ResetTitle"),
+            Self::Progress(progress) => write!(f, "Progress({progress:?})"),
             Self::ClipboardStore(data) => write!(f, "ClipboardStore({data})"),
             Self::ClipboardLoad(_) => f.write_str("ClipboardLoad"),
             Self::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
@@ -1047,6 +1054,7 @@ impl TerminalBuilder {
 
             selection_head: None,
             breadcrumb_text: String::new(),
+            progress: None,
             scroll_px: px(0.),
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
@@ -1334,6 +1342,7 @@ impl TerminalBuilder {
 
                 selection_head: None,
                 breadcrumb_text: String::new(),
+                progress: None,
                 scroll_px: px(0.),
                 next_link_id: 0,
                 selection_phase: SelectionPhase::Ended,
@@ -1541,6 +1550,7 @@ pub struct Terminal {
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
+    progress: Option<TerminalProgress>,
     title_override: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
@@ -1669,6 +1679,7 @@ impl Terminal {
                 self.breadcrumb_text = String::new();
                 cx.emit(Event::BreadcrumbsChanged);
             }
+            TerminalBackendEvent::Progress(progress) => self.set_progress(progress, cx),
             TerminalBackendEvent::ClipboardStore(data) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(data))
             }
@@ -1694,7 +1705,10 @@ impl Terminal {
             TerminalBackendEvent::Bell => {
                 cx.emit(Event::Bell);
             }
-            TerminalBackendEvent::Exit => self.register_task_finished(None, cx),
+            TerminalBackendEvent::Exit => {
+                self.set_progress(None, cx);
+                self.register_task_finished(None, cx);
+            }
             TerminalBackendEvent::MouseCursorDirty => {
                 //NOOP, Handled in render
             }
@@ -1721,8 +1735,22 @@ impl Terminal {
                 self.write_to_pty(format(color).into_bytes());
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
+                self.set_progress(None, cx);
                 self.register_task_finished(Some(exit_status), cx);
             }
+        }
+    }
+
+    /// The progress last reported by the running program with `OSC 9 ; 4`,
+    /// or `None` if it never reported any or cleared it.
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        self.progress
+    }
+
+    fn set_progress(&mut self, progress: Option<TerminalProgress>, cx: &mut Context<Self>) {
+        if self.progress != progress {
+            self.progress = progress;
+            cx.emit(Event::ProgressChanged);
         }
     }
 

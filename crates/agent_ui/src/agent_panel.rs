@@ -86,15 +86,16 @@ use project::{Project, ProjectPath, Worktree};
 use settings::{NotifyWhenAgentWaiting, Settings, SettingsStore, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
-use terminal::Event as TerminalEvent;
 #[cfg(any(test, feature = "test-support"))]
 use terminal::terminal_settings::TerminalSettings;
+use terminal::{Event as TerminalEvent, TerminalProgress};
 use terminal_view::TerminalView;
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    AgentThreadStatus, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -179,6 +180,7 @@ pub struct AgentPanelTerminalInfo {
     pub title: SharedString,
     pub created_at: DateTime<Utc>,
     pub has_notification: bool,
+    pub status: AgentThreadStatus,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
 }
@@ -1043,6 +1045,18 @@ impl AgentTerminal {
 
     fn custom_title(&self, cx: &App) -> Option<SharedString> {
         self.view.read(cx).custom_title().map(SharedString::from)
+    }
+
+    /// The thread status reported by the program in the terminal through `OSC 9 ; 4`.
+    fn status(&self, cx: &App) -> AgentThreadStatus {
+        match self.view.read(cx).terminal().read(cx).progress() {
+            Some(TerminalProgress::Normal(_) | TerminalProgress::Indeterminate) => {
+                AgentThreadStatus::Running
+            }
+            Some(TerminalProgress::Paused(_)) => AgentThreadStatus::WaitingForConfirmation,
+            Some(TerminalProgress::Error(_)) => AgentThreadStatus::Error,
+            None => AgentThreadStatus::Completed,
+        }
     }
 
     fn report_started_terminal_program(
@@ -2233,6 +2247,10 @@ impl AgentPanel {
                     this.report_terminal_program(terminal_id, source, cx);
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
+                TerminalEvent::ProgressChanged => {
+                    cx.emit(AgentPanelEvent::EntryChanged);
+                    cx.notify();
+                }
                 TerminalEvent::CloseTerminal => {
                     this.request_close_terminal_from_terminal_event(terminal_id, cx);
                 }
@@ -3403,6 +3421,7 @@ impl AgentPanel {
                 title: terminal.title(cx),
                 created_at: terminal.created_at,
                 has_notification: terminal.has_notification,
+                status: terminal.status(cx),
                 custom_title: terminal.custom_title(cx),
                 working_directory: terminal.working_directory.clone(),
             })

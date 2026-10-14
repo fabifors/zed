@@ -1309,6 +1309,8 @@ fn subscribe_for_terminal_events(
                     ),
                 },
                 Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
+                // Shown by the agent panel's thread list, which subscribes to the terminal itself.
+                Event::ProgressChanged => {}
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();

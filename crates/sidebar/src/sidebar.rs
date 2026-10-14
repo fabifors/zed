@@ -373,6 +373,8 @@ struct TerminalEntry {
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
+    /// Reported by the program in the terminal through `OSC 9 ; 4`.
+    status: AgentThreadStatus,
     highlight_positions: Vec<usize>,
 }
 
@@ -1448,15 +1450,15 @@ impl Sidebar {
 
         let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_terminal_statuses: HashMap<TerminalId, AgentThreadStatus> = HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
-                    agent_panel
-                        .read(cx)
-                        .terminals(cx)
-                        .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
-                );
+                for terminal in agent_panel.read(cx).terminals(cx) {
+                    if terminal.has_notification {
+                        live_notified_terminal_ids.insert(terminal.id);
+                    }
+                    live_terminal_statuses.insert(terminal.id, terminal.status);
+                }
             }
         }
 
@@ -1520,11 +1522,16 @@ impl Sidebar {
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
+                    let status = live_terminal_statuses
+                        .get(&metadata.terminal_id)
+                        .copied()
+                        .unwrap_or_default();
                     TerminalEntry {
                         metadata,
                         workspace,
                         worktrees,
                         has_notification,
+                        status,
                         highlight_positions: Vec::new(),
                     }
                 };
@@ -6639,6 +6646,7 @@ impl Sidebar {
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)
+            .status(terminal.status)
             .notified(terminal.has_notification)
             .highlight_positions(highlight_positions)
             .selected(is_active)
