@@ -1,0 +1,145 @@
+# Builds this fork: the commits on `fabifors/patches`, replayed on top of the latest
+# stable Zed release, bundled as an ad-hoc signed macOS app and published as a GitHub
+# release. Install it with `zed-plugins/zed-fork/zed-fork.sh install`.
+#
+# Runs weekly to pick up new Zed releases, on every push to the patch branch, and on demand.
+name: fabifors build
+
+on:
+  push:
+    branches: [fabifors/patches]
+  schedule:
+    # Thursdays 06:00 UTC; Zed usually ships stable releases on Wednesdays.
+    - cron: "0 6 * * 4"
+  workflow_dispatch:
+    inputs:
+      zed_tag:
+        description: "Zed release tag to build on, e.g. v1.24.0 (default: latest stable)"
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if a release for this combination already exists"
+        required: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabifors-build
+  cancel-in-progress: false
+
+env:
+  PATCH_BRANCH: fabifors/patches
+  UPSTREAM: https://github.com/zed-industries/zed.git
+
+jobs:
+  build:
+    if: github.repository_owner == 'fabifors'
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CARGO_INCREMENTAL: 0
+      # Faster, smaller build than Zed's release profile (thin LTO, one codegen unit).
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_PACKAGE_ZED_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # Compiled in: turns off Zed's auto-updater, which would replace this build with official Zed.
+      ZED_UPDATE_EXPLANATION: "This is a custom build of Zed from github.com/fabifors/zed. Update it with zed-plugins/zed-fork/zed-fork.sh."
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          active_xcode=$(xcode-select -p | sed 's#/Contents/Developer##')
+          for xcode in /Applications/Xcode_*.app; do
+            [ "$(cd "$xcode" && pwd -P)" = "$(cd "$active_xcode" && pwd -P)" ] || sudo rm -rf "$xcode"
+          done
+          xcrun simctl delete all || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator ~/Library/Android /usr/local/share/dotnet || true
+          df -h /
+
+      - name: Check out the patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Pick the Zed release
+        id: pick
+        run: |
+          set -euo pipefail
+          latest=$(git ls-remote --tags --refs "$UPSTREAM" 'v*' \
+            | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          tag="${{ inputs.zed_tag }}"
+          tag="${tag:-$latest}"
+          base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-pre' HEAD)
+          patches=$(git rev-parse --short=10 HEAD)
+          name="${tag}-fabifors-${patches}"
+          echo "Zed $tag (patch branch based on $base, at $patches) -> release $name"
+          {
+            echo "tag=$tag"
+            echo "base=$base"
+            echo "name=$name"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.force }}" != "true" ] && gh release view "$name" >/dev/null 2>&1; then
+            echo "Release $name already exists; nothing to build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replay the patches on ${{ steps.pick.outputs.tag }}
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.pick.outputs.tag }}"
+          base="${{ steps.pick.outputs.base }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --filter=blob:none "$UPSTREAM" "refs/tags/$tag:refs/tags/$tag"
+          if [ "$tag" != "$base" ]; then
+            git checkout --detach "$tag"
+            if ! git cherry-pick "$base..$PATCH_BRANCH"; then
+              git cherry-pick --abort || true
+              echo "::error::The patches do not apply cleanly to $tag. Rebase $PATCH_BRANCH onto it with zed-plugins/zed-fork/zed-fork.sh rebase."
+              exit 1
+            fi
+          fi
+          git log --oneline -5
+
+      - name: Rust cache
+        if: steps.pick.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fabifors-release
+          cache-on-failure: true
+
+      - name: Test the terminal progress scanner
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          rustc --edition 2024 --test crates/terminal/src/progress.rs -o "$RUNNER_TEMP/progress_test"
+          "$RUNNER_TEMP/progress_test"
+
+      - name: Bundle Zed.app
+        if: steps.pick.outputs.skip != 'true'
+        run: ./script/bundle-mac aarch64-apple-darwin
+
+      - name: Publish the release
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          name="${{ steps.pick.outputs.name }}"
+          gh release delete "$name" --yes --cleanup-tag 2>/dev/null || true
+          {
+            echo "Zed ${{ steps.pick.outputs.tag }} with the patches from \`$PATCH_BRANCH\`:"
+            echo
+            git log --no-merges --format='- %s' "${{ steps.pick.outputs.tag }}..HEAD"
+            echo
+            echo "Auto-update is turned off in this build. Install it with \`zed-plugins/zed-fork/zed-fork.sh install\`."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$name" target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
+            --target "$PATCH_BRANCH" \
+            --title "Zed ${{ steps.pick.outputs.tag }} (fabifors)" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest
